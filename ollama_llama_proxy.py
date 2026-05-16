@@ -112,6 +112,23 @@ def trim_messages_to_context(messages, max_chars=None):
 
     return system + others
 
+def log_incoming_messages(messages, path):
+    """Print incoming messages from VS Code in a readable format."""
+    print(f"\n=================== VS CODE -> LLM [{path}] ===================")
+    for i, m in enumerate(messages):
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # content parts — join text parts for display
+            content = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+        chars = len(content)
+        # truncate long messages (e.g. file contents) to keep log readable
+        preview = content[:300].replace("\n", " ")
+        if chars > 300:
+            preview += f"... [{chars} chars]"
+        print(f"  [{i}] {role:10s}: {preview}")
+    print("================================================================\n")
+
 def forward_stream_to_llama(path, body, wfile):
     if path == "/v1/chat/completions":
         messages = body.get("messages", [])
@@ -122,6 +139,7 @@ def forward_stream_to_llama(path, body, wfile):
         body["messages"] = messages
         body["add_generation_prompt"] = False
 
+    log_incoming_messages(body.get("messages", []), path)  # <-- add here
     data = json.dumps(body).encode()
     print(f"\n=================== STREAM START [{path}] ===================")
 
@@ -137,7 +155,7 @@ def forward_stream_to_llama(path, body, wfile):
     chunk_count = 0
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=240) as resp:
             while True:
                 line = resp.readline()
                 if not line:
@@ -164,9 +182,11 @@ def forward_stream_to_llama(path, body, wfile):
 
                             # --- QWEN REASONING REMAP ---
                             if "reasoning_content" in delta:
-                                delta.pop("reasoning_content")
+                                thinking = delta.pop("reasoning_content")
+                                if thinking and thinking.strip():
+                                    print(thinking, end="", flush=True)  # show thinking in console
                                 if not delta and choice.get("finish_reason") is None:
-                                    continue  # silent drop — these are very frequent
+                                    continue
 
                             # --- TELEMETRY FILTER ---
                             if not delta and choice.get("finish_reason") is None:
