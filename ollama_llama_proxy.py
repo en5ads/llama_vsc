@@ -21,6 +21,8 @@
 # Make sure llama.cpp is already running with --port 8080 before starting this proxy.
 
 import json
+import uuid
+import time
 import http.server
 import urllib.request
 import urllib.error
@@ -84,84 +86,95 @@ def forward_to_llama(path, body):
         print(f"[proxy] !!! llama.cpp returned {e.code}: {error_body[:500]}")
         return e.code, error_body
 
-import uuid
-import time
-import json
+def trim_messages_to_context(messages, max_chars=None):
+    """
+    Drop oldest non-system messages if total content exceeds the context limit.
+    Always keeps the system message and the last user message.
+    max_chars defaults to ~3 chars per token as a conservative estimate.
+    """
+    if max_chars is None:
+        max_chars = LLAMA_CONTEXT_SIZE * 3
+
+    total = sum(len(str(m.get("content", ""))) for m in messages)
+    if total <= max_chars:
+        return messages
+
+    print(f"[proxy] WARNING: trimming messages ({total} chars > {max_chars} limit)")
+    system = [m for m in messages if m["role"] == "system"]
+    others = [m for m in messages if m["role"] != "system"]
+
+    while len(others) > 1:
+        total = sum(len(str(m.get("content", ""))) for m in system + others)
+        if total <= max_chars:
+            break
+        dropped = others.pop(0)
+        print(f"[proxy] trimmed: role={dropped['role']} chars={len(str(dropped.get('content', '')))}")
+
+    return system + others
 
 def forward_stream_to_llama(path, body, wfile):
-    """Pipe SSE chunks from llama.cpp to client with remapping and heavy logging."""
-    # Force Qwen3 out of thinking mode by pre-closing the think block.
     if path == "/v1/chat/completions":
         messages = body.get("messages", [])
         if messages and messages[-1].get("role") == "assistant":
             messages.pop()
+        messages = trim_messages_to_context(messages)
         messages.append({"role": "assistant", "content": "</think>"})
         body["messages"] = messages
         body["add_generation_prompt"] = False
-        
+
     data = json.dumps(body).encode()
-    print(f"\n=================== STREAM START ===================")
-    print(f"[DEBUG] Path called: {path}")
-    print(f"====================================================")
-  
-    
+    print(f"\n=================== STREAM START [{path}] ===================")
+
     req = urllib.request.Request(
         f"http://{LLAMA_HOST}:{LLAMA_PORT}{path}",
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    
+
     chat_id = f"chatcmpl-{uuid.uuid4()}"
     model_name = body.get("model", "Qwen3.5-9B:latest")
-    reasoning_buffer = ""
     chunk_count = 0
-    
+
     try:
-        with urllib.request.urlopen(req, timeout=240) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             while True:
                 line = resp.readline()
                 if not line:
-                    print("[DEBUG-TRAFFIC] ---> Received EOF from llama.cpp.")
+                    print("\n[STREAM] EOF from llama.cpp.")
                     break
-                
+
                 decoded_line = line.decode('utf-8').strip()
                 if not decoded_line:
                     continue
-                
+
                 chunk_count += 1
-                print(f"\n[RAW FROM LLAMA] Chk #{chunk_count}: {decoded_line}")
-                
+
                 if decoded_line.startswith("data:"):
                     if "[DONE]" in decoded_line:
-                        print("[DEBUG-DECISION] ---> Detected literal [DONE].")
                         break
-                    
+
                     try:
                         json_str = decoded_line.replace("data:", "").strip()
                         parsed_json = json.loads(json_str)
-                        
+
                         if "choices" in parsed_json and len(parsed_json["choices"]) > 0:
                             choice = parsed_json["choices"][0]
                             delta = choice.get("delta", {})
-                            
+
                             # --- QWEN REASONING REMAP ---
                             if "reasoning_content" in delta:
-                                delta.pop("reasoning_content")  # always discard reasoning
-                                # If nothing left in delta, drop the whole chunk
+                                delta.pop("reasoning_content")
                                 if not delta and choice.get("finish_reason") is None:
-                                    print("[DEBUG-REMAP] Dropped pure reasoning chunk.")
-                                    continue
-                            
+                                    continue  # silent drop — these are very frequent
+
                             # --- TELEMETRY FILTER ---
                             if not delta and choice.get("finish_reason") is None:
-                                # This is usually a metadata/timing chunk
-                                print("[DEBUG-DECISION] ---> DROPPED: Empty delta/telemetry chunk.")
-                                continue
+                                continue  # silent drop
 
-                            # --- STOP BLOCK SANITIZATION ---
+                            # --- STOP BLOCK ---
                             if choice.get("finish_reason") == "stop":
-                                print("[DEBUG-DECISION] ---> SANITIZING: Formatting final stop block.")
+                                print(f"[STREAM] stop after {chunk_count} chunks")
                                 clean_stop = {
                                     "id": parsed_json.get("id", chat_id),
                                     "object": "chat.completion.chunk",
@@ -173,19 +186,19 @@ def forward_stream_to_llama(path, body, wfile):
                                 wfile.flush()
                                 continue
 
-                            # Standard Output (includes remapped content)
-                            #print(f"[DEBUG-DECISION] ---> PASSING: Valid chunk (Count: {chunk_count})")
+                            # --- NORMAL CONTENT CHUNK — just print the token ---
+                            token = delta.get("content", "")
+                            if token:
+                                print(token, end="", flush=True)
                             wfile.write(f"data: {json.dumps(parsed_json)}\n\n".encode('utf-8'))
+
                         else:
-                            # Check if this is a usage/telemetry chunk (empty choices but has usage)
+                            # Usage/telemetry chunk
                             if "usage" in parsed_json:
                                 usage = parsed_json["usage"]
                                 prompt_tokens = usage.get("prompt_tokens", 0)
                                 completion_tokens = usage.get("completion_tokens", 0)
-                                print(f"[DEBUG-USAGE] prompt_tokens={prompt_tokens} completion_tokens={completion_tokens}")
-                                
-                                # Inject an Ollama-style final chunk with token counts
-                                # VS Code reads these to update the context ring
+                                print(f"\n[STREAM] tokens: prompt={prompt_tokens} completion={completion_tokens} total={prompt_tokens+completion_tokens} ctx={LLAMA_CONTEXT_SIZE} ({100*prompt_tokens//LLAMA_CONTEXT_SIZE}% used)")
                                 ollama_final = {
                                     "id": parsed_json.get("id", chat_id),
                                     "object": "chat.completion.chunk",
@@ -197,38 +210,35 @@ def forward_stream_to_llama(path, body, wfile):
                                         "completion_tokens": completion_tokens,
                                         "total_tokens": usage.get("total_tokens", prompt_tokens + completion_tokens)
                                     },
-                                    # Ollama-specific fields VS Code uses for the context ring
+                                    "num_ctx": LLAMA_CONTEXT_SIZE,
                                     "prompt_eval_count": prompt_tokens,
                                     "eval_count": completion_tokens,
                                 }
                                 wfile.write(f"data: {json.dumps(ollama_final)}\n\n".encode('utf-8'))
                                 wfile.flush()
-                            else:
-                                print(f[DEBUG-DECISION] ---> DROPPED: No choices in JSON.")
-                            continue
-                            
+                            # all other empty-choices chunks dropped silently
+
                     except json.JSONDecodeError:
-                        print("[DEBUG-DECISION] ---> WRAPPING: Converting raw string to OpenAI JSON.")
+                        # Unusual — log in full
+                        print(f"\n[STREAM] WARNING: non-JSON chunk #{chunk_count}: {decoded_line}")
                         raw_text = decoded_line.replace("data:", "").strip()
                         openai_chunk = {
                             "id": chat_id, "object": "chat.completion.chunk", "created": int(time.time()),
                             "model": model_name, "choices": [{"index": 0, "delta": {"content": raw_text}, "finish_reason": None}]
                         }
                         wfile.write(f"data: {json.dumps(openai_chunk)}\n\n".encode('utf-8'))
-                
+
                 wfile.flush()
 
-            # End of stream
-            print("[DEBUG-TRAFFIC] ---> Injecting trailing [DONE] block.")
-            wfile.write(b"data: [DONE]\n\n")
-            wfile.flush()
-            print("=================== STREAM END =====================\n")
-            
+        wfile.write(b"data: [DONE]\n\n")
+        wfile.flush()
+        print(f"=================== STREAM END ===================\n")
+
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
-        print(f"\n[proxy] !!! HTTP {e.code} from llama.cpp: {error_body[:500]}")
+        print(f"\n[STREAM] HTTP {e.code} from llama.cpp: {error_body[:500]}")
     except Exception as e:
-        print(f"\n[proxy] !!! CRITICAL ERROR !!!: {e}")
+        print(f"\n[STREAM] CRITICAL ERROR: {e}")
 
 
 def responses_to_chat_completions(parsed):
