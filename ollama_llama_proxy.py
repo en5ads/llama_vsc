@@ -25,13 +25,43 @@ import http.server
 import urllib.request
 import urllib.error
 from datetime import datetime
+import re
 
 # --- Configuration ---
 LLAMA_HOST = "localhost"          # llama.cpp server host
 LLAMA_PORT = 8080                 # llama.cpp server port
 PROXY_PORT = 11434                # must match Ollama's default so VS Code finds it
-MODEL_NAME = "huihui-qwen3:latest"  # Ollama REQUIRES the 'name:tag' format
+MODEL_NAME = "Qwen3.5-9B:latest"  # Ollama REQUIRES the 'name:tag' format
 
+TOOL_CALL_PATTERN = re.compile(
+    r'<tool_call>.*?</tool_call>',
+    re.DOTALL
+)
+TOOL_CALL_OPEN = re.compile(r'<tool_call>.*$', re.DOTALL)
+
+def get_llama_context_size():
+    """Read actual context size from llama.cpp /props at startup."""
+    try:
+        req = urllib.request.Request(f"http://{LLAMA_HOST}:{LLAMA_PORT}/props")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            props = json.loads(resp.read().decode())
+            ctx = props.get("default_generation_settings", {}).get("n_ctx", 32768)
+            print(f"[proxy] llama.cpp context size: {ctx}")
+            return ctx
+    except Exception as e:
+        print(f"[proxy] WARNING: couldn't read /props, defaulting context to 32768: {e}")
+        return 32768
+
+# At module level, read once at startup
+LLAMA_CONTEXT_SIZE = get_llama_context_size()
+
+def sanitize_reasoning_content(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = TOOL_CALL_PATTERN.sub('', text)   # strip complete blocks
+    cleaned = TOOL_CALL_OPEN.sub('', cleaned)    # strip unclosed opening tags
+    cleaned = re.sub(r'</tool_call>', '', cleaned) # strip orphaned closing tags
+    return cleaned  # NO strip() — preserve spaces between tokens!
 
 def forward_to_llama(path, body):
     """Send a non-streaming POST to llama.cpp and return (status_code, response_text)."""
@@ -44,33 +74,161 @@ def forward_to_llama(path, body):
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req) as resp:
-        response_text = resp.read().decode()
-        print(f"[proxy] <- llama.cpp {resp.status}  response: {response_text[:300]}")
-        return resp.status, response_text
+    try:
+        with urllib.request.urlopen(req) as resp:
+            response_text = resp.read().decode()
+            print(f"[proxy] <- llama.cpp {resp.status}  response: {response_text[:300]}")
+            return resp.status, response_text
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        print(f"[proxy] !!! llama.cpp returned {e.code}: {error_body[:500]}")
+        return e.code, error_body
 
+import uuid
+import time
+import json
 
 def forward_stream_to_llama(path, body, wfile):
-    """Pipe SSE chunks from llama.cpp directly to the client."""
+    """Pipe SSE chunks from llama.cpp to client with remapping and heavy logging."""
+    # Force Qwen3 out of thinking mode by pre-closing the think block.
+    if path == "/v1/chat/completions":
+        messages = body.get("messages", [])
+        if messages and messages[-1].get("role") == "assistant":
+            messages.pop()
+        messages.append({"role": "assistant", "content": "</think>"})
+        body["messages"] = messages
+        body["add_generation_prompt"] = False
+        
     data = json.dumps(body).encode()
-    print(f"[proxy] -> llama.cpp POST {path}  (streaming)")
-    print(f"[proxy]    body: {json.dumps(body)[:300]}")
+    print(f"\n=================== STREAM START ===================")
+    print(f"[DEBUG] Path called: {path}")
+    print(f"====================================================")
+  
+    
     req = urllib.request.Request(
         f"http://{LLAMA_HOST}:{LLAMA_PORT}{path}",
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req) as resp:
-        chunk_count = 0
-        while True:
-            chunk = resp.read(4096)
-            if not chunk:
-                break
-            wfile.write(chunk)
+    
+    chat_id = f"chatcmpl-{uuid.uuid4()}"
+    model_name = body.get("model", "Qwen3.5-9B:latest")
+    reasoning_buffer = ""
+    chunk_count = 0
+    
+    try:
+        with urllib.request.urlopen(req, timeout=240) as resp:
+            while True:
+                line = resp.readline()
+                if not line:
+                    print("[DEBUG-TRAFFIC] ---> Received EOF from llama.cpp.")
+                    break
+                
+                decoded_line = line.decode('utf-8').strip()
+                if not decoded_line:
+                    continue
+                
+                chunk_count += 1
+                print(f"\n[RAW FROM LLAMA] Chk #{chunk_count}: {decoded_line}")
+                
+                if decoded_line.startswith("data:"):
+                    if "[DONE]" in decoded_line:
+                        print("[DEBUG-DECISION] ---> Detected literal [DONE].")
+                        break
+                    
+                    try:
+                        json_str = decoded_line.replace("data:", "").strip()
+                        parsed_json = json.loads(json_str)
+                        
+                        if "choices" in parsed_json and len(parsed_json["choices"]) > 0:
+                            choice = parsed_json["choices"][0]
+                            delta = choice.get("delta", {})
+                            
+                            # --- QWEN REASONING REMAP ---
+                            if "reasoning_content" in delta:
+                                delta.pop("reasoning_content")  # always discard reasoning
+                                # If nothing left in delta, drop the whole chunk
+                                if not delta and choice.get("finish_reason") is None:
+                                    print("[DEBUG-REMAP] Dropped pure reasoning chunk.")
+                                    continue
+                            
+                            # --- TELEMETRY FILTER ---
+                            if not delta and choice.get("finish_reason") is None:
+                                # This is usually a metadata/timing chunk
+                                print("[DEBUG-DECISION] ---> DROPPED: Empty delta/telemetry chunk.")
+                                continue
+
+                            # --- STOP BLOCK SANITIZATION ---
+                            if choice.get("finish_reason") == "stop":
+                                print("[DEBUG-DECISION] ---> SANITIZING: Formatting final stop block.")
+                                clean_stop = {
+                                    "id": parsed_json.get("id", chat_id),
+                                    "object": "chat.completion.chunk",
+                                    "created": parsed_json.get("created", int(time.time())),
+                                    "model": model_name,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                                }
+                                wfile.write(f"data: {json.dumps(clean_stop)}\n\n".encode('utf-8'))
+                                wfile.flush()
+                                continue
+
+                            # Standard Output (includes remapped content)
+                            #print(f"[DEBUG-DECISION] ---> PASSING: Valid chunk (Count: {chunk_count})")
+                            wfile.write(f"data: {json.dumps(parsed_json)}\n\n".encode('utf-8'))
+                        else:
+                            # Check if this is a usage/telemetry chunk (empty choices but has usage)
+                            if "usage" in parsed_json:
+                                usage = parsed_json["usage"]
+                                prompt_tokens = usage.get("prompt_tokens", 0)
+                                completion_tokens = usage.get("completion_tokens", 0)
+                                print(f"[DEBUG-USAGE] prompt_tokens={prompt_tokens} completion_tokens={completion_tokens}")
+                                
+                                # Inject an Ollama-style final chunk with token counts
+                                # VS Code reads these to update the context ring
+                                ollama_final = {
+                                    "id": parsed_json.get("id", chat_id),
+                                    "object": "chat.completion.chunk",
+                                    "created": parsed_json.get("created", int(time.time())),
+                                    "model": model_name,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    "usage": {
+                                        "prompt_tokens": prompt_tokens,
+                                        "completion_tokens": completion_tokens,
+                                        "total_tokens": usage.get("total_tokens", prompt_tokens + completion_tokens)
+                                    },
+                                    # Ollama-specific fields VS Code uses for the context ring
+                                    "prompt_eval_count": prompt_tokens,
+                                    "eval_count": completion_tokens,
+                                }
+                                wfile.write(f"data: {json.dumps(ollama_final)}\n\n".encode('utf-8'))
+                                wfile.flush()
+                            else:
+                                print(f[DEBUG-DECISION] ---> DROPPED: No choices in JSON.")
+                            continue
+                            
+                    except json.JSONDecodeError:
+                        print("[DEBUG-DECISION] ---> WRAPPING: Converting raw string to OpenAI JSON.")
+                        raw_text = decoded_line.replace("data:", "").strip()
+                        openai_chunk = {
+                            "id": chat_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                            "model": model_name, "choices": [{"index": 0, "delta": {"content": raw_text}, "finish_reason": None}]
+                        }
+                        wfile.write(f"data: {json.dumps(openai_chunk)}\n\n".encode('utf-8'))
+                
+                wfile.flush()
+
+            # End of stream
+            print("[DEBUG-TRAFFIC] ---> Injecting trailing [DONE] block.")
+            wfile.write(b"data: [DONE]\n\n")
             wfile.flush()
-            chunk_count += 1
-        print(f"[proxy] <- llama.cpp stream finished ({chunk_count} chunks)")
+            print("=================== STREAM END =====================\n")
+            
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        print(f"\n[proxy] !!! HTTP {e.code} from llama.cpp: {error_body[:500]}")
+    except Exception as e:
+        print(f"\n[proxy] !!! CRITICAL ERROR !!!: {e}")
 
 
 def responses_to_chat_completions(parsed):
@@ -86,12 +244,10 @@ def responses_to_chat_completions(parsed):
     """
     messages = []
 
-    # "instructions" becomes a system message
     instructions = parsed.get("instructions")
     if instructions:
         messages.append({"role": "system", "content": instructions})
 
-    # "input" can be a plain string or a list of message objects
     input_field = parsed.get("input", [])
     if isinstance(input_field, str):
         messages.append({"role": "user", "content": input_field})
@@ -99,11 +255,26 @@ def responses_to_chat_completions(parsed):
         for item in input_field:
             role = item.get("role", "user")
             content = item.get("content", "")
-            # content can itself be a list of content parts
             if isinstance(content, list):
-                text_parts = [
-                    p.get("text", "") for p in content if p.get("type") == "text"
-                ]
+                text_parts = []
+                for p in content:
+                    ptype = p.get("type", "")
+                    if ptype == "text":
+                        text_parts.append(p.get("text", ""))
+                    elif ptype == "input_file":
+                        # File content — extract filename + text if present
+                        fname = p.get("filename", "file")
+                        ftext = p.get("file_data", "") or p.get("text", "")
+                        if ftext:
+                            text_parts.append(f"[File: {fname}]\n{ftext}")
+                        else:
+                            text_parts.append(f"[File attached: {fname}]")
+                    elif ptype in ("image_url", "image_file"):
+                        # llama.cpp can handle image_url natively — pass through
+                        text_parts.append(p.get("text", "[image]"))
+                    else:
+                        # Unknown part type — log and skip rather than crash
+                        print(f"[proxy] WARNING: unknown content part type '{ptype}' — skipping")
                 content = "\n".join(text_parts)
             messages.append({"role": role, "content": content})
 
@@ -113,11 +284,11 @@ def responses_to_chat_completions(parsed):
         "stream": parsed.get("stream", False),
     }
 
-    # Pass through optional sampling params if present
     for key in ("temperature", "top_p", "max_tokens", "stop"):
         if key in parsed:
             chat_body[key] = parsed[key]
 
+    print(f"[proxy] responses_to_chat: {len(messages)} messages, last role={messages[-1]['role'] if messages else 'none'}")
     return chat_body
 
 
@@ -145,7 +316,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
         print(f"[proxy] GET {self.path}")
 
         if self.path in ("/", "/api/version"):
-            print(f"[proxy]   -> version probe, returning 0.6.4")
+            print("[proxy]   -> version probe, returning 0.6.4")
             self.send_json(200, {"version": "0.6.4"})
 
         elif self.path == "/api/tags":
@@ -202,7 +373,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {
                     "model": MODEL_NAME,
                     "modelfile": f"FROM {MODEL_NAME}",
-                    "parameters": "temperature 1.0\ntop_p 0.95",
+                    "parameters": f"temperature 1.0\ntop_p 0.95\nnum_ctx {LLAMA_CONTEXT_SIZE}",
                     "template": "{{ .Prompt }}",
                     "details": {
                         "parent_model": "",
@@ -216,7 +387,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                         "general.architecture": "qwen3",
                         "general.parameter_count": 27000000000,
                         "general.quantization_version": 2,
-                        "qwen3.context_length": 65000,
+                        "qwen3.context_length": LLAMA_CONTEXT_SIZE,
                         "qwen3.attention.head_count": 32,
                     },
                     "capabilities": ["completion", "tools"]
@@ -269,7 +440,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             # We just forward it straight through to llama.cpp on port 8080.
             elif self.path == "/v1/chat/completions":
                 parsed["model"] = parsed.get("model", MODEL_NAME)
-                print(f"[proxy]   -> /v1/chat/completions passthrough to llama.cpp")
+                print("[proxy]   -> /v1/chat/completions passthrough to llama.cpp")
                 if is_stream:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -287,7 +458,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             # Newer VS Code Copilot agent mode uses the OpenAI Responses API.
             # llama.cpp doesn't speak this; we translate it to Chat Completions first.
             elif self.path == "/v1/responses":
-                print(f"[proxy]   -> /v1/responses (Responses API) -> translating to Chat Completions")
+                print("[proxy]   -> /v1/responses (Responses API) -> translating to Chat Completions")
                 chat_body = responses_to_chat_completions(parsed)
                 is_stream = chat_body.get("stream", False)
                 if is_stream:
